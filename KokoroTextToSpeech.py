@@ -115,7 +115,58 @@ zh_kk_config_path = os.path.join(zh_kokoro_path, "config.json")
 zh_kk_model_path = os.path.join(zh_kokoro_path, "kokoro-v1_1-zh.pth")
 zh_voices_path = os.path.join(zh_kokoro_path, "voices")
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# 改进的设备检测函数
+def get_optimal_device():
+    """
+    获取最优的计算设备
+    优先级: CUDA > MPS > CPU
+    """
+    if torch.cuda.is_available():
+        device = 'cuda'
+        logger.info("Using CUDA device")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+        logger.info("Using MPS (Metal Performance Shaders) device")
+    else:
+        device = 'cpu'
+        logger.info("Using CPU device")
+    
+    return device
+
+# 安全的张量转换函数
+def safe_tensor_to_device(tensor, device):
+    """
+    安全地将张量转移到指定设备
+    处理MPS可能的兼容性问题
+    """
+    try:
+        if device == 'mps':
+            # MPS有时对某些操作支持不完全，添加错误处理
+            return tensor.to(device)
+        else:
+            return tensor.to(device)
+    except Exception as e:
+        logger.warning(f"Failed to move tensor to {device}, falling back to CPU: {e}")
+        return tensor.to('cpu')
+
+# 安全的模型转换函数
+def safe_model_to_device(model, device):
+    """
+    安全地将模型转移到指定设备
+    """
+    try:
+        if device == 'mps':
+            # 对于MPS，某些模型层可能不兼容，需要特殊处理
+            model = model.to(device)
+            logger.info(f"Model successfully moved to {device}")
+        else:
+            model = model.to(device)
+        return model
+    except Exception as e:
+        logger.warning(f"Failed to move model to {device}, falling back to CPU: {e}")
+        return model.to('cpu')
+
+device = get_optimal_device()
 
 MODEL_CACHE = None
 VOICE_TENSOR = None
@@ -127,6 +178,7 @@ class KokoroRun:
                 "voice": (all_speakers, {"default": "zm_yunyang.pt"}),
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "unload_model": ("BOOLEAN", {"default": True}),
+                "force_cpu": ("BOOLEAN", {"default": False}),  # 添加强制使用CPU的选项
             },
         }
 
@@ -143,29 +195,53 @@ class KokoroRun:
         else:
             raise ValueError("This is a unsupported voice")
 
-    def generate(self, text, voice, unload_model):
+    def generate(self, text, voice, unload_model, force_cpu=False):
         global MODEL_CACHE, VOICE_TENSOR
+        
+        # 根据用户选择确定使用的设备
+        current_device = 'cpu' if force_cpu else device
+        
         if MODEL_CACHE is None:      
-            MODEL_CACHE = KModel(
-                        config = kk_config_path,
-                        model = kk_model_path).to(device).eval()
+            try:
+                MODEL_CACHE = KModel(
+                            config = kk_config_path,
+                            model = kk_model_path)
+                MODEL_CACHE = safe_model_to_device(MODEL_CACHE, current_device).eval()
+            except Exception as e:
+                logger.error(f"Failed to load model on {current_device}: {e}")
+                # 回退到CPU
+                current_device = 'cpu'
+                MODEL_CACHE = KModel(
+                            config = kk_config_path,
+                            model = kk_model_path).to('cpu').eval()
 
         lang = self._get_lang(voice)
         pipeline = KPipeline(lang_code=lang, repo_id=None, model=MODEL_CACHE)
-        VOICE_TENSOR = torch.load(Path(voices_path, voice), weights_only=True)
+        
+        try:
+            VOICE_TENSOR = torch.load(Path(voices_path, voice), weights_only=True)
+            VOICE_TENSOR = safe_tensor_to_device(VOICE_TENSOR, current_device)
+        except Exception as e:
+            logger.warning(f"Failed to load voice tensor to {current_device}: {e}")
+            VOICE_TENSOR = torch.load(Path(voices_path, voice), weights_only=True)
 
         try:
             generator = pipeline(text, voice=VOICE_TENSOR, speed=1, split_pattern=r"\n+")
             audio_data = []
             for i, (gs, ps, data) in enumerate(generator):
                 audio_data.append(data)
+            
             audio_tensor = torch.from_numpy(np.concatenate(audio_data, axis=0)).unsqueeze(0).unsqueeze(0).float()
-            logger.info(f"Generated audio with shape: {audio_tensor.shape}")
+            logger.info(f"Generated audio with shape: {audio_tensor.shape} on device: {current_device}")
 
             if unload_model:
                 MODEL_CACHE = None
                 VOICE_TENSOR = None
-                torch.cuda.empty_cache()
+                if current_device == 'cuda':
+                    torch.cuda.empty_cache()
+                elif current_device == 'mps':
+                    if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                        torch.mps.empty_cache()
 
             return ({"waveform": audio_tensor, "sample_rate": 24000},)
         
@@ -175,7 +251,11 @@ class KokoroRun:
             if unload_model:
                 MODEL_CACHE = None
                 VOICE_TENSOR = None
-                torch.cuda.empty_cache()
+                if current_device == 'cuda':
+                    torch.cuda.empty_cache()
+                elif current_device == 'mps':
+                    if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                        torch.mps.empty_cache()
             raise
 
 MODEL_CACHE_ZH = None
@@ -189,6 +269,7 @@ class KokoroZHRun:
                 "voice": (zh_all_speakers, {"default": "zf_001.pt"}),
                 "text": ("STRING", {"default": "", "multiline": True}),
                 "unload_model": ("BOOLEAN", {"default": True}),
+                "force_cpu": ("BOOLEAN", {"default": False}),  # 添加强制使用CPU的选项
             },
         }
 
@@ -196,31 +277,71 @@ class KokoroZHRun:
     RETURN_NAMES = ("audio",)
     FUNCTION = "generate"
     CATEGORY = "🎤MW/MW-KokoroTTS"
-    def generate(self, text, voice, unload_model):
+    
+    def generate(self, text, voice, unload_model, force_cpu=False):
         REPO_ID = 'hexgrad/Kokoro-82M-v1.1-zh'
         global MODEL_CACHE_ZH, EN_MODEL_CACHE_ZH, VOICE_TENSOR_ZH
-        if MODEL_CACHE_ZH is None:
-            MODEL_CACHE_ZH = KModel(
-                        repo_id=REPO_ID,
-                        config = zh_kk_config_path,
-                        model = zh_kk_model_path).to(device).eval()
-
-            EN_MODEL_CACHE_ZH = KPipeline(lang_code='a',
-                                repo_id=REPO_ID, 
-                                model=False)
         
+        # 根据用户选择确定使用的设备
+        current_device = 'cpu' if force_cpu else device
+        
+        if MODEL_CACHE_ZH is None:
+            try:
+                MODEL_CACHE_ZH = KModel(
+                            repo_id=REPO_ID,
+                            config = zh_kk_config_path,
+                            model = zh_kk_model_path)
+                MODEL_CACHE_ZH = safe_model_to_device(MODEL_CACHE_ZH, current_device).eval()
+
+                try:
+                    EN_MODEL_CACHE_ZH = KPipeline(lang_code='a',
+                                        repo_id=REPO_ID, 
+                                        model=False)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize EN_MODEL_CACHE_ZH: {e}")
+                    EN_MODEL_CACHE_ZH = None
+            except Exception as e:
+                logger.error(f"Failed to load ZH model on {current_device}: {e}")
+                # 回退到CPU
+                current_device = 'cpu'
+                MODEL_CACHE_ZH = KModel(
+                            repo_id=REPO_ID,
+                            config = zh_kk_config_path,
+                            model = zh_kk_model_path).to('cpu').eval()
+
+                try:
+                    EN_MODEL_CACHE_ZH = KPipeline(lang_code='a',
+                                        repo_id=REPO_ID, 
+                                        model=False)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize EN_MODEL_CACHE_ZH: {e}")
+                    EN_MODEL_CACHE_ZH = None
+        
+        # 定义一个更安全的 en_callable 函数
         def en_callable(text):
-            if text == 'Kokoro':
-                return 'kˈOkəɹO'
-            elif text == 'Sol':
-                return 'sˈOl'
-            return next(EN_MODEL_CACHE_ZH(text)).phonemes
+            # 如果 EN_MODEL_CACHE_ZH 不可用，使用简单的回退方案
+            if EN_MODEL_CACHE_ZH is None:
+                logger.warning("Using fallback en_callable function")
+                # 简单的回退方案，返回一些基本音素
+                if text == 'Kokoro':
+                    return 'kˈOkəɹO'
+                elif text == 'Sol':
+                    return 'sˈOl'
+                # 对于其他英文单词，返回简单的音素表示
+                return ''.join([c if c.isalpha() else ' ' for c in text])
+            
+            try:
+                # 正常路径
+                return next(EN_MODEL_CACHE_ZH(text)).phonemes
+            except Exception as e:
+                logger.warning(f"Error in en_callable: {e}")
+                # 出错时的回退方案
+                return ''.join([c if c.isalpha() else ' ' for c in text])
         
         zh_pipeline = KPipeline(lang_code="z", 
                         repo_id=REPO_ID, 
                         model=MODEL_CACHE_ZH, 
                         en_callable=en_callable)
-        VOICE_TENSOR_ZH = torch.load(Path(zh_voices_path, voice), weights_only=True)
         
         def speed_callable(len_ps):
             speed = 0.8
@@ -231,30 +352,46 @@ class KokoroZHRun:
             return speed * 1.1
         
         try:
-            generator = zh_pipeline(text, voice=VOICE_TENSOR_ZH, speed=speed_callable, split_pattern=r"\n+")
+            # Construct the full path for the voice file
+            voice_file_path = os.path.join(zh_voices_path, voice)
+            # 直接将 voice 字符串传递给 pipeline
+            generator = zh_pipeline(
+                text, 
+                voice=voice_file_path, # 传递完整的语音文件路径
+                speed=speed_callable, 
+                split_pattern=r"\n+"
+            )
             audio_data = []
             for i, (gs, ps, data) in enumerate(generator):
                 audio_data.append(data)
                 audio_data.append(np.zeros(5000))
 
             audio_tensor = torch.from_numpy(np.concatenate(audio_data, axis=0)).unsqueeze(0).unsqueeze(0).float()
-            logger.info(f"Generated audio with shape: {audio_tensor.shape}")
+            logger.info(f"Generated ZH audio with shape: {audio_tensor.shape} on device: {current_device}")
 
             if unload_model:
                 MODEL_CACHE_ZH = None
                 EN_MODEL_CACHE_ZH = None
                 VOICE_TENSOR_ZH = None
-                torch.cuda.empty_cache()
+                if current_device == 'cuda':
+                    torch.cuda.empty_cache()
+                elif current_device == 'mps':
+                    if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                        torch.mps.empty_cache()
                 
             return ({"waveform": audio_tensor, "sample_rate": 24000},)
         
         except Exception as e:
-            logger.error(f"Generation failed: {str(e)}")
+            logger.error(f"ZH Generation failed: {str(e)}")
             if unload_model:
                 MODEL_CACHE_ZH = None
                 EN_MODEL_CACHE_ZH = None
                 VOICE_TENSOR_ZH = None
-                torch.cuda.empty_cache()
+                if current_device == 'cuda':
+                    torch.cuda.empty_cache()
+                elif current_device == 'mps':
+                    if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+                        torch.mps.empty_cache()
             raise
 
 
