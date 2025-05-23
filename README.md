@@ -1,4 +1,4 @@
-[中文](README-CN.md) | [English](README.md) 
+[中文](README-MAC.md) | [English](README.md) 
 
 # Kokoro TextToSpeech Node for ComfyUI
 
